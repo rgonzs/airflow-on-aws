@@ -1,0 +1,1019 @@
+Description: "Template de cloudformation creado para crear las instancias de airflow"
+Transform: AWS::LanguageExtensions
+Parameters:
+  NetworkStackName:
+    Description: Network Stack Name
+    Default: kodelab-network-stack
+    Type: String
+    MinLength: '1'
+    MaxLength: '255'
+  S3ConfigStackName:
+    Description: S3 Config Stack Name
+    Default: airflow-config-bucket
+    Type: String
+  EnvType:
+    Description: Environment type.
+    Default: dev
+    Type: String
+    AllowedValues: [prod, dev]
+    ConstraintDescription: must specify prod or dev.
+  AirflowAmi:
+    Description: AMI ID of Airflow
+    Type: AWS::EC2::Image::Id
+  WebServerInstanceSize:
+    Description: Instance size of webservers launch template
+    Default: "t2.micro"
+    Type: String
+    AllowedValues:
+      - t2.micro
+      - t2.medium
+      - t3.medium
+      - t3.micro
+  WorkersInstanceSize:
+    Description: Instance size of webserver workers.
+    Default: t2.micro
+    Type: String
+    AllowedValues:
+    - t2.micro
+    - t2.medium
+    - t3.medium
+    - t3.micro
+  ServersKeyName:
+    Description: Key Pair used to connect to servers.
+    Type: AWS::EC2::KeyPair::KeyName
+  RedisCacheSize:
+    Description: Node type from elasticache cache cluster
+    Type: String
+    Default: cache.t2.micro
+    AllowedValues:
+    - "cache.t2.micro"
+  RedisPassword:
+    Type: String
+    Default: /airflow/redis/dbpasswordairflow
+    Description: Name of the SSM parameter referencing redis password.
+  RDSInstanceClass:
+    Description: Instance class of RDS DB Instance
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues:
+      - db.t4g.micro
+      - db.t3.micro
+  RDSInstanceStorage:
+    Description: Postgres RDS storage
+    Type: String
+    Default: '20'
+  RDSInstanceVersion:
+    Description: Postgres RDS version
+    Type: String
+    Default: '15.3'
+  RDSInstanceBackupPeriod:
+    Description: Postgres RDS backup time retention. For dev is recomended 0 to disable.
+    Type: Number
+    Default: 15
+  RDSMasterUser:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /airflow/postgres/masteruser
+  RDSMasterPassword:
+    Type: String
+    Default: /airflow/postgres/masterpassword
+    Description: Name of the SSM parameter referencing rds master password.
+  RDSAirflowUser:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /airflow/postgres/userairflow
+  RDSAirflowPassword:
+    Type: String
+    Default: /airflow/postgres/passwordairflow
+    Description: Name of the SSM parameter referencing rds airflow password.
+  RDSDbName:
+    Type: String
+    Default: airflow_db
+  AirflowFernetKey:
+    Type: String
+    Default: /airflow/config/fernetkey
+    Description: Parameter containing fernet key to be used in airflow.cfg
+  AirflowSecretKey:
+    Type: String
+    Default: /airflow/config/secretkey
+    Description: Parameter containing secret key to be used in airflow.cfg
+  AirflowConfigVersionId:
+    Type: String
+    Description: Version ID of the "airflow.cfg" template s3 bucket.
+  AirflowImageHelperDbUri:
+    Type: String
+    Description: Docker image URI airflow db helper
+Conditions:
+  CreateProdResources: !Equals [ !Ref EnvType, "prod"]
+Resources:
+  AirflowServerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies: 
+      - PolicyName: !Sub "${AWS::StackName}-s3-read-only-access"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action: "s3:GetObject"
+            Resource: !Sub
+            - "${BucketArn}/*"
+            - BucketArn:
+                Fn::ImportValue:
+                  !Sub "${S3ConfigStackName}-S3ConfigBucketBucketArn"
+      - PolicyName: !Sub "${AWS::StackName}-autoscaling-set-instancehealth"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: autoscaling:SetInstanceHealth
+            Resource: ["*"]
+  AirflowServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref AirflowServerInstanceRole
+  # BLOCK: REDIS
+  RedisCacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      ReplicationGroupDescription: !Sub "${AWS::StackName}-redis-airflow-cluster"
+      CacheSubnetGroupName: !Ref RedisCacheClusterSubnetGroup
+      EngineVersion: '5.0.6'
+      SecurityGroupIds:
+        - !Ref RedisCacheClusterSecurityGroup
+      NumNodeGroups: !If [ CreateProdResources, 3, 1]
+      AutomaticFailoverEnabled: false
+      Engine: redis
+      AtRestEncryptionEnabled: true
+      MultiAZEnabled: !If [ CreateProdResources, true, false]
+      CacheNodeType: !Ref RedisCacheSize
+      AuthToken: !Sub '{{resolve:ssm-secure:${RedisPassword}}}'
+      TransitEncryptionEnabled: true
+  RedisCacheClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: Airflow Redis Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WorkersSecurityGroup
+  RedisCacheClusterSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Airflow Redis Subnet Group Cache
+      SubnetIds:
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbA'
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbB'
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbC'
+  # BLOCK: POSTGRESQL
+  RDSPostgresInstance:
+    Type: AWS::RDS::DBInstance
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-postgres-airflow-database"
+      DBName: !Ref RDSDbName
+      MasterUsername: !Ref RDSMasterUser
+      MasterUserPassword: !Sub '{{resolve:ssm-secure:${RDSMasterPassword}}}'
+      Engine: postgres
+      EngineVersion: !Ref RDSInstanceVersion
+      DBInstanceClass: !Ref RDSInstanceClass
+      AllocatedStorage: !Ref RDSInstanceStorage
+      DBSubnetGroupName: !Ref RDSPostgresInstanceSubnetGroup
+      MultiAZ: !If [ CreateProdResources, true, false]
+      BackupRetentionPeriod: !Ref RDSInstanceBackupPeriod
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref RDSPostgresInstanceSecurityGroup
+  RDSPostgresInstanceSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Security group created for RDS Instance to be used by apache airflow
+      SubnetIds:
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbA'
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbB'
+      - Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetDbC'
+  RDSPostgresInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: Airflow RDS Posgtres Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WorkersSecurityGroup
+  # BLOCK: EFS STORAGE
+  EFS:
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Type: AWS::EFS::FileSystem
+    Properties:
+      BackupPolicy:
+        Status: !If [ CreateProdResources, 'ENABLED', 'DISABLED' ]
+      PerformanceMode: generalPurpose
+      Encrypted: true
+  EFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SecurityGroups:
+        - Ref: "EFSSecurityGroup"
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetAppA'
+  EFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SecurityGroups:
+        - Ref: "EFSSecurityGroup"
+      SubnetId:
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetAppB'
+  EFSMountTargetC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SecurityGroups:
+        - Ref: "EFSSecurityGroup"
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-SubnetAppC'
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group created to control access to EFS"
+      GroupName: !Sub  "${AWS::StackName}-efs-sg"
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WorkersSecurityGroup
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+  EFSAccessPointDags:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFS
+      PosixUser:
+        Uid: "30000"
+        Gid: "30000"
+        SecondaryGids:
+        - "1000"
+        - "1001"
+      RootDirectory:
+        CreationInfo:
+          OwnerUid: "30000"
+          OwnerGid: "30000"
+          Permissions: "0775"
+        Path: /dags
+      AccessPointTags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-access-point-dags'
+  EFSPolicyModify:
+    Type: Custom::EFSPolicyModify
+    Properties:
+      ServiceToken: !GetAtt EFSLambdaPolicyWorkaround.Arn
+      FileSystemId: !Ref EFS
+      Policy: 
+        Fn::ToJsonString:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: AllowEFSDagsMountPoint
+              Effect: "Allow"
+              Action:
+              - "elasticfilesystem:ClientMount"
+              - "elasticfilesystem:ClientWrite"
+              Principal:
+                AWS: !GetAtt AirflowServerInstanceRole.Arn
+              Condition:
+                ArnEquals:
+                  elasticfilesystem:AccessPointArn: !GetAtt  EFSAccessPointDags.Arn
+  EFSLambdaPolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-efs-policy-lambda-logs"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: !Sub "${AWS::StackName}-efs-lambda-access-role"
+        PolicyDocument: 
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "elasticfilesystem:ModifyMountTargetSecurityGroups"
+            - "elasticfilesystem:PutAccountPreferences"
+            - "elasticfilesystem:PutBackupPolicy"
+            - "elasticfilesystem:PutFileSystemPolicy"
+            - "elasticfilesystem:PutLifecycleConfiguration"
+            - "elasticfilesystem:UpdateFileSystem"
+            Resource: !GetAtt EFS.Arn
+  EFSLambdaPolicyWorkaround:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import cfnresponse
+            import boto3
+
+            def lambda_handler(event, context):
+                print(event)
+                if event['RequestType'] == 'Delete':
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                    return
+                efs = boto3.client('efs', region_name='${AWS::Region}')
+                try:
+                    efs.put_file_system_policy(
+                        FileSystemId=event['ResourceProperties']['FileSystemId'],
+                        Policy=event['ResourceProperties']['Policy']
+                    )
+                    response_data = {}
+                    response_data['FileSystemId'] = event['ResourceProperties']['FileSystemId']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, "CustomResourcePhysicalID")
+                except Exception as e:
+                    print("Error executing lambda function.")
+                    print(e)
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+      Role: !GetAtt EFSLambdaPolicyRole.Arn
+      Timeout: 30
+  # BLOCK: AIRFLOW WEB
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: Airflow WebServer Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - "AirflowConfigCreator"
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        rolebased:
+          type: S3
+          buckets:
+          - Fn::ImportValue:
+              !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+          roleName:
+            Ref: AirflowServerInstanceRole
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            apt:
+              git: []
+              binutils: []
+          commands:
+            airflowconfig:
+              command: |
+                sudo mkdir -p /home/airflow/airflow
+                sudo mkdir -p /home/airflow/airflow/dags
+                sudo chown -R airflow:airflow /home/airflow/airflow
+            efsutils:
+              command: |
+                git clone https://github.com/aws/efs-utils; cd efs-utils
+                ./build-deb.sh
+                sudo apt-get -y install ./build/amazon-efs-utils*deb
+              cwd: /opt
+            initdb:
+              command: su airflow -c "/home/airflow/.local/bin/airflow db migrate"
+              cwd: /home/airflow
+            mount-efs:
+              command: !Sub
+              - echo "${FileSystemId} /home/airflow/airflow/dags efs _netdev,tls,iam,accesspoint=${AccessPointId} 0 0" >> /etc/fstab; mount -a 
+              - FileSystemId: !GetAtt EFS.FileSystemId
+                AccessPointId: !GetAtt EFSAccessPointDags.AccessPointId
+              cwd: /home/airflow
+            servicereload:
+              command: "sudo systemctl daemon-reload"
+          files:
+            /etc/systemd/system/airflow-web.service: 
+              source: !Sub 
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/airflow-web.service"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /home/airflow/airflow/airflow.cfg: 
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/config/airflow.cfg"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+          services:
+            systemd:
+              airflow-web:
+                enabled: "true"
+                ensureRunning: "true"
+                commands:
+                - initdb
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-web-server-lt
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt AirflowServerInstanceProfile.Arn
+        ImageId: !Ref AirflowAmi
+        InstanceType: !Ref WebServerInstanceSize
+        SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+        KeyName: !Ref ServersKeyName
+        DisableApiTermination: false
+        UserData: !Base64 
+          'Fn::Sub':
+            - |
+              #!/bin/bash -xe
+              /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerLaunchTemplate --region ${AWS::Region}
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerLaunchTemplate --region ${AWS::Region}
+            - {}
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MaxSize: '1'
+      MinSize: '0'
+      DesiredCapacity: '1'
+      HealthCheckType: ELB
+      TargetGroupARNs:
+      - !Ref WebServerLoadBalancerTargetGroup
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-web-server-asg
+        PropagateAtLaunch: true
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppA"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppB"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppC"
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+      - !Ref WebServerLoadBalancerSecurityGroup
+      Subnets:
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebA'
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebB'
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebC'
+  WebServerLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: "forward"
+        TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+        Order: 1
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Name: !Sub '${AWS::StackName}-web-tg'
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckPort: "8080"
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      IpAddressType: ipv4
+      Port: 8080
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      TargetType: instance
+      Matcher:
+        HttpCode: 200,201,300,301,302
+      VpcId: 
+        'Fn::ImportValue': !Sub '${NetworkStackName}-VPCID'
+  WebServerLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        'Fn::ImportValue': !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: WebServerLoadBalancer Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  # BLOCK: AIRFLOW SCHEDULER
+  SchedulerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - "AirflowConfigCreator"
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        rolebased:
+          type: S3
+          buckets:
+          - Fn::ImportValue:
+              !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+          roleName:
+            Ref: AirflowServerInstanceRole
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            apt:
+              git: []
+              binutils: []
+          commands:
+            airflowconfig:
+              command: |
+                sudo mkdir -p /opt/helpers
+                sudo mkdir -p /home/airflow/airflow
+                sudo mkdir -p /home/airflow/airflow/dags
+                sudo chown -R airflow:airflow /home/airflow/airflow
+                sudo chown -R airflow:airflow /opt/helpers
+            servicereload:
+              command: "sudo systemctl daemon-reload"
+            efsutils:
+              command: |
+                git clone https://github.com/aws/efs-utils; cd efs-utils
+                ./build-deb.sh
+                sudo apt-get -y install ./build/amazon-efs-utils*deb
+              cwd: /opt
+            mount-efs:
+              command: !Sub
+              - echo "${FileSystemId} /home/airflow/airflow/dags efs _netdev,tls,iam,accesspoint=${AccessPointId} 0 0" >> /etc/fstab; mount -a 
+              - FileSystemId: !GetAtt EFS.FileSystemId
+                AccessPointId: !GetAtt EFSAccessPointDags.AccessPointId
+              cwd: /home/airflow
+          files:
+            /opt/helpers/health-checker.sh:
+              mode: '000740'
+              owner: airflow
+              group: airflow
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/helpers/ec2-health-check.sh"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /etc/systemd/system/health-checker.service:
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/health-checker.service"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /etc/systemd/system/airflow-scheduler.service: 
+              source: !Sub 
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/airflow-scheduler.service"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /home/airflow/airflow/airflow.cfg: 
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/config/airflow.cfg"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+          services:
+            systemd:
+              airflow-scheduler:
+                enabled: "true"
+                ensureRunning: "true"
+              health-checker:
+                enabled: "true"
+                ensureRunning: "true"
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-scheduler-lt
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt AirflowServerInstanceProfile.Arn
+        ImageId: !Ref AirflowAmi
+        InstanceType: !Ref WebServerInstanceSize
+        SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+        KeyName: !Ref ServersKeyName
+        DisableApiTermination: false
+        UserData: !Base64 
+          'Fn::Sub':
+            - |
+              #!/bin/bash -xe
+              /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource SchedulerLaunchTemplate --region ${AWS::Region}
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource SchedulerLaunchTemplate --region ${AWS::Region}
+            - {}
+  SchedulerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref SchedulerLaunchTemplate
+        Version: !GetAtt SchedulerLaunchTemplate.LatestVersionNumber
+      MaxSize: '1'
+      MinSize: '0'
+      DesiredCapacity: '1'
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-scheduler-asg
+        PropagateAtLaunch: true
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppA"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppB"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppC"
+  # BLOCK: AIRFLOW WORKERS
+  WorkersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: Airflow Workers Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8793
+          ToPort: 8793
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  WorkersLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - "AirflowConfigCreator"
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        rolebased:
+          type: S3
+          buckets:
+          - Fn::ImportValue:
+              !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+          roleName:
+            Ref: AirflowServerInstanceRole
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            apt:
+              git: []
+              binutils: []
+          commands:
+            airflowconfig:
+              command: |
+                sudo mkdir -p /opt/helpers
+                sudo mkdir -p /home/airflow/airflow
+                sudo mkdir -p /home/airflow/airflow/dags
+                sudo chown -R airflow:airflow /home/airflow/airflow
+                sudo chown -R airflow:airflow /opt/helpers
+            servicereload:
+              command: "sudo systemctl daemon-reload"
+            efsutils:
+              command: |
+                git clone https://github.com/aws/efs-utils; cd efs-utils
+                ./build-deb.sh
+                sudo apt-get -y install ./build/amazon-efs-utils*deb
+              cwd: /opt
+            mount-efs:
+              command: !Sub
+              - echo "${FileSystemId} /home/airflow/airflow/dags efs _netdev,tls,iam,accesspoint=${AccessPointId} 0 0" >> /etc/fstab; mount -a 
+              - FileSystemId: !GetAtt EFS.FileSystemId
+                AccessPointId: !GetAtt EFSAccessPointDags.AccessPointId
+              cwd: /home/airflow
+          files:
+            /opt/helpers/health-checker.sh:
+              mode: '000740'
+              owner: airflow
+              group: airflow
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/helpers/ec2-health-check.sh"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /etc/systemd/system/health-checker.service:
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/health-checker.service"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /etc/systemd/system/airflow-worker.service: 
+              source: !Sub 
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/airflow-worker.service"
+              - Bucket:
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /home/airflow/airflow/airflow.cfg: 
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/config/airflow.cfg"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+          services:
+            systemd:
+              airflow-worker:
+                enabled: "true"
+                ensureRunning: "true"
+              health-checker:
+                enabled: "false"
+                ensureRunning: "false"
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-workers-lt
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt AirflowServerInstanceProfile.Arn
+        ImageId: !Ref AirflowAmi
+        InstanceType: !Ref WorkersInstanceSize
+        SecurityGroupIds:
+        - !Ref WorkersSecurityGroup
+        KeyName: !Ref ServersKeyName
+        DisableApiTermination: false
+        UserData: !Base64 
+          'Fn::Sub':
+            - |
+              #!/bin/bash -xe
+              /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource WorkersLaunchTemplate --region ${AWS::Region}
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WorkersLaunchTemplate --region ${AWS::Region}
+            - {}
+  WorkersAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkersLaunchTemplate
+        Version: !GetAtt WorkersLaunchTemplate.LatestVersionNumber
+      MaxSize: '1'
+      MinSize: '0'
+      DesiredCapacity: '1'
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-workers-asg
+        PropagateAtLaunch: true
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppA"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppB"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetAppC"
+  # BLOCK: AIRFLOW CONFIGS
+  AirflowConfigCreator:
+    Type: Custom::AirflowConfiguration
+    Properties:
+      ServiceToken: !GetAtt AirflowConfigLambdaFunction.Arn
+      BucketName: 
+        'Fn::ImportValue': !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+      RDSUri: 
+        User: !Ref RDSAirflowUser
+        Password: !Ref RDSAirflowPassword
+        Address: !GetAtt RDSPostgresInstance.Endpoint.Address
+        Port: !GetAtt RDSPostgresInstance.Endpoint.Port
+        DbName: !Ref RDSDbName
+      RedisUri:
+        Address: !GetAtt RedisCacheCluster.PrimaryEndPoint.Address
+        Port: !GetAtt RedisCacheCluster.PrimaryEndPoint.Port
+        Password: !Ref RedisPassword
+      Airflow:
+        FernetKey: !Ref AirflowFernetKey
+        SecretKey: !Ref AirflowSecretKey
+        ConfigVersion: !Ref AirflowConfigVersionId
+  AirflowConfigLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import cfnresponse
+            import boto3
+            import io
+            import sys, logging, traceback, json
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+
+            def lambda_handler(event, context):
+                logger.info(event)
+                if event['RequestType'] == 'Delete':
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                    return
+                s3 = boto3.client('s3', region_name='${AWS::Region}')
+                ssm = boto3.client('ssm', region_name='${AWS::Region}')
+                
+                try:
+                    config = io.BytesIO()
+                    #  AIRFLOW CONFIG VERSION ID
+                    config_version = event['ResourceProperties']['Airflow']['ConfigVersion']
+
+                    # POSTGRES CONFIG
+                    postgres_password = ssm.get_parameter(Name=event['ResourceProperties']['RDSUri']['Password'], WithDecryption=True)['Parameter']['Value']
+                    postgres_user = event['ResourceProperties']['RDSUri']['User']
+                    postgres_address = event['ResourceProperties']['RDSUri']['Address']
+                    postgres_port = event['ResourceProperties']['RDSUri']['Port']
+                    postgres_db = event['ResourceProperties']['RDSUri']['DbName']
+                    rds_uri = f'postgresql+psycopg2://{postgres_user}:{postgres_password}@{postgres_address}:{postgres_port}/{postgres_db}'
+                    # REDIS CONFIG
+                    redis_password = ssm.get_parameter(Name=event['ResourceProperties']['RedisUri']['Password'], WithDecryption=True)['Parameter']['Value']
+                    redis_port = event['ResourceProperties']['RedisUri']['Port']
+                    redis_address = event['ResourceProperties']['RedisUri']['Address']
+                    redis_uri = f'rediss://:{redis_password}@{redis_address}:{redis_port}/0?ssl_cert_reqs=CERT_OPTIONAL'
+                    # AIRFLOW SECRETS
+                    fernet_key = ssm.get_parameter(Name=event['ResourceProperties']['Airflow']['FernetKey'], WithDecryption=True)['Parameter']['Value']
+                    secret_key = ssm.get_parameter(Name=event['ResourceProperties']['Airflow']['SecretKey'], WithDecryption=True)['Parameter']['Value']
+                    # DOWNLOAD CONFIG TEMPLATE
+                    s3.download_fileobj(
+                        Bucket = event['ResourceProperties']['BucketName'],
+                        Key = 'config-templates/airflow.cfg',
+                        Fileobj = config,
+                        ExtraArgs = {'VersionId': config_version}
+                    )
+                    template = config.getvalue().decode('utf-8')
+                    template = template.replace('#{FERNET_KEY}', fernet_key)
+                    template = template.replace('#{SECRET_KEY}', secret_key)
+                    template = template.replace('#{POSTGRES_URI}', rds_uri)
+                    template = template.replace('#{REDIS_URI}', redis_uri)
+                    s3.upload_fileobj(
+                        Bucket = event['ResourceProperties']['BucketName'],
+                        Key = 'config/airflow.cfg',
+                        Fileobj = io.BytesIO(str.encode(template, encoding='utf-8'))
+                    )
+                    response_data = {}
+                    response_data['BucketName'] = event['ResourceProperties']['BucketName']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, "AirflowConfigCreator")
+                except Exception:
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                    exception_type, exception_value, exception_traceback = sys.exc_info()
+                    traceback_string = traceback.format_exception(exception_type, exception_value, exception_traceback)
+                    err_msg = json.dumps({
+                        "errorType": exception_type.__name__,
+                        "errorMessage": str(exception_value),
+                        "stackTrace": traceback_string
+                    })
+                    logger.error(err_msg)
+
+      Role: !GetAtt AirflowConfigLambdaRole.Arn
+      Timeout: 30
+  AirflowConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-ssm-parameters"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/airflow/*"
+      - PolicyName: !Sub "${AWS::StackName}-airflow-config-lambda-logs"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: !Sub "${AWS::StackName}-airflow-config-ecr"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "ecr:BatchGetImage"
+            - "ecr:GetDownloadUrlForLayer"
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: !Sub "${AWS::StackName}-airflow-config-network"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:CreateNetworkInterface
+            - ec2:DeleteNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            Resource: "*"
+      - PolicyName: !Sub "${AWS::StackName}-s3-read-only-access"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action: ["s3:GetObject","s3:PutObject","s3:GetObjectVersion"]
+            Resource: !Sub
+            - "${BucketArn}/*"
+            - BucketArn:
+                Fn::ImportValue:
+                  !Sub "${S3ConfigStackName}-S3ConfigBucketBucketArn"
+  AirflowConfigDbUser:
+    Type: Custom::RDSUser
+    Properties:
+      ServiceToken: !GetAtt AirflowConfigDbLambda.Arn
+      RDSUri:
+        Address: !GetAtt RDSPostgresInstance.Endpoint.Address
+        Port: !GetAtt RDSPostgresInstance.Endpoint.Port
+        DbName: !Ref RDSDbName
+  AirflowConfigDbLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ImageUri: !Ref AirflowImageHelperDbUri
+      Role: !GetAtt AirflowConfigLambdaRole.Arn
+      PackageType: Image
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+        SubnetIds:
+        - Fn::ImportValue:
+            !Sub "${NetworkStackName}-SubnetAppA"

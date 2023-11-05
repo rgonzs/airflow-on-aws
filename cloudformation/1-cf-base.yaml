@@ -1,0 +1,239 @@
+Description: Base template to create Networking components.
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.16.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: kodelab-vpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: kodelab-igw
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  RouteTableWeb:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: kodelab-vpc-rt-web
+  RouteTableWebDefaultIPV4:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTableWeb
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  RouteTableAssociationWebA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableWeb
+      SubnetId: !Ref SubnetWebA
+  RouteTableAssociationWebB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableWeb
+      SubnetId: !Ref SubnetWebB
+  RouteTableAssociationWebC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableWeb
+      SubnetId: !Ref SubnetWebC
+  SubnetWebA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.16.0.0/20
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: sn-web-A
+  SubnetWebB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.16.16.0/20
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: sn-web-B
+  SubnetWebC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 2, !GetAZs '' ]
+      CidrBlock: 10.16.32.0/20
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: sn-web-C
+  RouteTableDB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: kodelab-vpc-rt-db
+  RouteTableAssociationDbA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableDB
+      SubnetId: !Ref SubnetDBA
+  RouteTableAssociationDbB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableDB
+      SubnetId: !Ref SubnetDBB
+  RouteTableAssociationDbC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableDB
+      SubnetId: !Ref SubnetDBC
+  SubnetDBA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.16.48.0/20
+      Tags:
+      - Key: Name
+        Value: sn-db-A
+  SubnetDBB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.16.64.0/20
+      Tags:
+      - Key: Name
+        Value: sn-db-B
+  SubnetDBC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 2, !GetAZs '' ]
+      CidrBlock: 10.16.80.0/20
+      Tags:
+      - Key: Name
+        Value: sn-db-C
+  RouteTableApp:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: kodelab-vpc-rt-app
+  RouteTableAssociationAppA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableApp
+      SubnetId: !Ref SubnetAppA
+  RouteTableAssociationAppB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableApp
+      SubnetId: !Ref SubnetAppB
+  RouteTableAssociationAppC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableApp
+      SubnetId: !Ref SubnetAppC  
+  SubnetAppA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.16.96.0/20
+      Tags:
+      - Key: Name
+        Value: sn-app-A
+  SubnetAppB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.16.112.0/20
+      Tags:
+      - Key: Name
+        Value: sn-app-B
+  SubnetAppC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 2, !GetAZs '' ]
+      CidrBlock: 10.16.128.0/20
+      Tags:
+      - Key: Name
+        Value: sn-app-C
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+      RouteTableIds:
+      - !Ref RouteTableApp
+      - !Ref RouteTableDB
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export: 
+      Name: !Sub "${AWS::StackName}-VPCID"
+  SubnetWebA:
+    Description: WebA Subnet ID
+    Value: !Ref SubnetWebA
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetWebA"
+  SubnetWebB:
+    Description: WebB Subnet ID
+    Value: !Ref SubnetWebB
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetWebB"
+  SubnetWebC:
+    Description: WebC Subnet ID
+    Value: !Ref SubnetWebC
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetWebC"
+  SubnetAppA:
+    Description: AppA Subnet ID
+    Value: !Ref SubnetAppA
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetAppA"
+  SubnetAppB:
+    Description: AppB Subnet ID
+    Value: !Ref SubnetAppB
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetAppB"
+  SubnetAppC:
+    Description: AppC Subnet ID
+    Value: !Ref SubnetAppC
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetAppC"
+  SubnetDbA:
+    Description: DbA Subnet ID
+    Value: !Ref SubnetDBA
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetDbA"
+  SubnetDbB:
+    Description: DbB Subnet ID
+    Value: !Ref SubnetDBB
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetDbB"
+  SubnetDbC:
+    Description: DbC Subnet ID
+    Value: !Ref SubnetDBC
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetDbC"

@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Template created to build an ami image pipeline using ec2 image builder
+Parameters:
+  UbuntuLatestAmi:
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Type: AWS::SSM::Parameter::Value<String>
+Resources:
+  PythonComponent:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: python-component-builder
+      Platform: Linux
+      Version: '3.10.0'
+      Description: 'Component used to install python 3.10 and pip 3.10 on ubuntu AMI'
+      SupportedOsVersions:
+        - 'Ubuntu'
+      Data: |
+        name: PythonInstallUbuntu - InlineData
+        description: Usado para instalar python y pip 3.10
+        schemaVersion: 1.0
+        parameters:
+          - User:
+              type: string
+              default: 'ubuntu'
+              description: The user where you want to install pip
+          - Uid:
+              type: string
+              default: '30000'
+              description: UID to be used for the new user.
+        phases:
+          - name: build
+            steps:
+            - name: CreateCustomUser
+              action: ExecuteBash
+              inputs:
+                commands:
+                - |
+                  if [[ "{{ User }}" != 'ubuntu' ]]; then
+                    id -u "{{ User }}" &>/dev/null || sudo useradd -m "{{ User }}" -u "{{ Uid }}" -G sudo -s /bin/bash
+                  fi
+
+            - name: PythonInstallStep
+              action: ExecuteBash
+              inputs:
+                commands: 
+                - |
+                  #!/bin/bash -xu
+                  sudo apt update
+                  sudo apt -y install python3-pip
+                  sudo runuser -l "{{ User }}" -c 'echo "export PIP_HOME=/home/$(whoami)/.local/bin" >> ~/.bashrc'
+                  sudo runuser -l "{{ User }}" -c 'echo "export PATH=\$PATH:\$PIP_HOME" >> ~/.bashrc'
+
+  PostgresClientComponent:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: postgresql-client-component-builder
+      Platform: Linux
+      Version: '15.0.1'
+      Description: 'Component used to install postgresql client on ubuntu AMI'
+      SupportedOsVersions:
+        - 'Ubuntu'
+      Data: |
+        name: PostgresClientInstallUbuntu - InlineData
+        description: Component created to install psql and postgresqlclient in ubuntu
+        schemaVersion: 1.0
+        parameters:
+          - PostgresVersion:
+              type: string
+              default: '15'
+              description: The postgresql client version to install
+        phases:
+          - name: build
+            steps:
+            - name: PythonInstallStep
+              action: ExecuteBash
+              inputs:
+                commands: 
+                - |
+                  #!/bin/bash -xu
+                  sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+                  wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc &>/dev/null
+                  sudo apt update
+                  sudo apt install -y 'postgresql-client-{{ PostgresVersion }}'
+
+  AirflowComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: airflow-component-builder
+      Version: '2.7.1'
+      Platform: Linux
+      Description: 'Component used to install airflow on ubuntu AMI'
+      SupportedOsVersions:
+        - "Ubuntu"
+      Data: |
+        name: AirflowInstallUbuntu - InlineData
+        description: 'Component used to install airflow on ubuntu AMI'
+        schemaVersion: 1.0
+        parameters:
+          - Libraries:
+              type: string
+              default: celery,postgres,redis,rabbitmq
+              description: Packages to install with apache airflow, comma separated without spaces
+        phases:
+          - name: build
+            steps:
+            - name: AirflowInstallStep
+              action: ExecuteBash
+              inputs:
+                commands:
+                - |
+                  #!/bin/bash -xu
+                  export AIRFLOW_VERSION=2.7.1
+                  export PYTHON_CONSTRAINT_VERSION=`python3 -V | awk '{printf $2}' | cut -d "." -f 1,2`
+                  export POSTGRES_VERSION=15
+                  export CONSTRAINS_URL=https://raw.githubusercontent.com/apache/airflow/constraints-$AIRFLOW_VERSION/constraints-$PYTHON_CONSTRAINT_VERSION.txt
+
+                  sudo su - airflow -c "pip install apache-airflow==$AIRFLOW_VERSION --constraint $CONSTRAINS_URL"
+
+            - name: AirflowLibsInstallStep
+              action: ExecuteBash
+              inputs:
+                commands:
+                - |
+                  #!/bin/bash -xu
+                  export AIRFLOW_VERSION=2.7.1
+                  export PYTHON_CONSTRAINT_VERSION=`python3 -V | awk '{printf $2}' | cut -d "." -f 1,2`
+                  export POSTGRES_VERSION=15
+                  export CONSTRAINS_URL=https://raw.githubusercontent.com/apache/airflow/constraints-$AIRFLOW_VERSION/constraints-$PYTHON_CONSTRAINT_VERSION.txt
+
+                  sudo su - airflow -c "pip install apache-airflow[{{ Libraries }}]==$AIRFLOW_VERSION --constraint $CONSTRAINS_URL"
+
+  AwsCFNComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: aws-cfn-bootstrap-component-builder
+      Version: '1.0.0'
+      Platform: Linux
+      Description: 'Component used to install airflow on ubuntu AMI'
+      SupportedOsVersions:
+        - "Ubuntu"
+      Data: |
+        name: AwsCFNComponent - InlineData
+        description: 'Component used to CloudFormation helper scripts on Ubuntu AMI'
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+            - name: InstallCfnHelper
+              action: ExecuteBash
+              inputs:
+                commands:
+                - |
+                  #!/bin/bash -xe
+
+                  sudo apt update
+                  sudo apt -y install python3-pip
+                  mkdir -p /opt/aws/
+                  sudo pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                  sudo ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+
+  AirflowImageBuilderInfraestructure:
+    Type: 'AWS::ImageBuilder::InfrastructureConfiguration'
+    Properties:
+      Name: 'airflow-image-builder-infraestructure'
+      InstanceProfileName: !Ref AirflowImageInstanceProfile
+      Description: Image builder infraestructure to create images for airflow ubuntu
+      InstanceTypes:
+        - t2.micro
+      TerminateInstanceOnFailure: true
+      Tags:
+        Project: Airflow-Cloud
+
+  AirflowImageInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: '/'
+      Roles: [!Ref ImageInfraestructureBuilderRole]
+
+  ImageInfraestructureBuilderRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder"
+        - "arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilderECRContainerBuilds"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: airflow-ubuntu-recipe
+      AdditionalInstanceConfiguration:
+        SystemsManagerAgent:
+          UninstallAfterBuild: true
+      ParentImage: !Ref UbuntuLatestAmi
+      Version: '1.0.0'
+      Components:
+      - ComponentArn: !Ref PythonComponent
+        Parameters:
+        - Name: "User"
+          Value:
+              - "airflow"
+        - Name: "Uid"
+          Value: 
+          - "30000"
+      - ComponentArn: !Ref PostgresClientComponent
+        Parameters:
+        - Name: PostgresVersion
+          Value:
+              - "15"
+      - ComponentArn: !Ref AirflowComponent
+        Parameters:
+        - Name: Libraries
+          Value:
+              - "celery,postgres,redis,rabbitmq"
+      - ComponentArn: !Ref AwsCFNComponent
+      - ComponentArn: 'arn:aws:imagebuilder:us-east-1:aws:component/aws-cli-version-2-linux/1.0.3/1'
+
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: airflow-image-distribution
+      Distributions:
+        - Region: !Ref "AWS::Region"
+          AmiDistributionConfiguration:
+            TargetAccountIds:
+              - !Ref AWS::AccountId
+
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: airflow-image-pipeline
+      ImageRecipeArn: !Ref ImageRecipe
+      Description: ImagePipeline created to build images for apache airflow based on ubuntu AMI.
+      Status: ENABLED
+      InfrastructureConfigurationArn: !Ref AirflowImageBuilderInfraestructure
+      DistributionConfigurationArn: !Ref DistributionConfiguration

@@ -1,0 +1,216 @@
+Transform: 'AWS::LanguageExtensions'
+Parameters:
+  NetworkStackName:
+    Description: Network Stack Name
+    Default: kodelab-network-stack
+    Type: String
+    MinLength: '1'
+    MaxLength: '255'
+  S3ConfigStackName:
+    Description: S3 Config Stack Name
+    Default: airflow-config-bucket
+    Type: String
+  AirflowAmi:
+    Type: AWS::EC2::Image::Id
+  WebServerInstanceSize:
+    Description: Instance size of webservers launch template
+    Default: "t2.micro"
+    Type: String
+    AllowedValues:
+      - t2.micro
+  ServersKeyName:
+    Description: Key Pair used to connect to servers.
+    Type: AWS::EC2::KeyPair::KeyName
+Resources:
+  WebServerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies: 
+      - PolicyName: !Sub "${AWS::StackName}-s3-read-only-access"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action: "s3:GetObject"
+            Resource: !Sub
+            - "${BucketArn}/*"
+            - BucketArn:
+                Fn::ImportValue:
+                  !Sub "${S3ConfigStackName}-S3ConfigBucketBucketArn"
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref WebServerInstanceRole
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: Airflow WebServer Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        rolebased:
+          type: S3
+          buckets:
+          - Fn::ImportValue:
+              !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+          roleName:
+            Ref: WebServerInstanceRole
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            airflowconfig:
+              command: |
+                sudo mkdir -p /home/airflow/airflow
+                sudo chown -R airflow:airflow /home/airflow/airflow
+            servicereload:
+              command: "sudo systemctl daemon-reload"
+          files:
+            /etc/systemd/system/airflow-web.service: 
+              source: !Sub 
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/services/airflow-web.service"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+            /home/airflow/airflow/airflow.cfg: 
+              source: !Sub
+              - "https://${Bucket}.s3.${AWS::Region}.amazonaws.com/config/airflow.cfg"
+              - Bucket:         
+                  Fn::ImportValue:
+                    !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+              authentication: rolebased
+          services:
+            systemd:
+              airflow-web:
+                enabled: "true"
+                ensureRunning: "true"
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-web-server-launch-template
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt WebServerInstanceProfile.Arn
+        ImageId: !Ref AirflowAmi
+        InstanceType: !Ref WebServerInstanceSize
+        SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+        KeyName: !Ref ServersKeyName
+        DisableApiTermination: false
+        UserData: !Base64 
+          'Fn::Sub':
+            - |
+              #!/bin/bash -xe
+              /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerLaunchTemplate --region ${AWS::Region}
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerLaunchTemplate --region ${AWS::Region}
+              sudo apt -y install apache2
+              sudo systemctl enable --now apache2 
+            - {}
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MaxSize: '1'
+      MinSize: '0'
+      DesiredCapacity: '1'
+      TargetGroupARNs:
+      - !Ref WebServerLoadBalancerTargetGroup
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-web-server
+        PropagateAtLaunch: true
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetWebA"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetWebB"
+      - Fn::ImportValue:
+          !Sub "${NetworkStackName}-SubnetWebC"
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-loadbalancer'
+      IpAddressType: ipv4
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+      - !Ref WebServerLoadBalancerSecurityGroup
+      Subnets:
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebA'
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebB'
+      - 'Fn::ImportValue': !Sub '${NetworkStackName}-SubnetWebC'
+  WebServerLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: "forward"
+        TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+        Order: 1
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Name: !Sub '${AWS::StackName}-web-targetgroup'
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckPort: "80"
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      IpAddressType: ipv4
+      Port: 80
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      TargetType: instance
+      VpcId: 
+        'Fn::ImportValue': !Sub '${NetworkStackName}-VPCID'
+  WebServerLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: 
+        'Fn::ImportValue': !Sub '${NetworkStackName}-VPCID'
+      GroupDescription: WebServerLoadBalancer Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+Outputs:
+  LoadBalancerUrl:
+    Description: Web Server loadbalancer url
+    Value: !GetAtt WebServerLoadBalancer.DNSName

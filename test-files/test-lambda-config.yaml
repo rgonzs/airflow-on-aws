@@ -1,0 +1,248 @@
+Description: "Template de cloudformation creado para crear las instancias de airflow"
+Transform: AWS::LanguageExtensions
+Parameters:
+  NetworkStackName:
+    Description: Network Stack Name
+    Default: kodelab-network-stack
+    Type: String
+    MinLength: '1'
+    MaxLength: '255'
+  S3ConfigStackName:
+    Description: S3 Config Stack Name
+    Default: airflow-config-bucket
+    Type: String
+  EnvType:
+    Description: Environment type.
+    Default: dev
+    Type: String
+    AllowedValues: [prod, dev]
+    ConstraintDescription: must specify prod or dev.
+  AirflowAmi:
+    Description: AMI ID of Airflow
+    Type: AWS::EC2::Image::Id
+  WebServerInstanceSize:
+    Description: Instance size of webservers launch template
+    Default: "t2.micro"
+    Type: String
+    AllowedValues:
+      - t2.micro
+  ServersKeyName:
+    Description: Key Pair used to connect to servers.
+    Type: AWS::EC2::KeyPair::KeyName
+  RedisCacheSize:
+    Description: Node type from elasticache cache cluster
+    Type: String
+    Default: cache.t2.micro
+    AllowedValues:
+    - "cache.t2.micro"
+  RedisPassword:
+    Type: String
+    Default: /airflow/redis/dbpasswordairflow
+    Description: Name of the SSM parameter referencing redis password.
+  RDSInstanceClass:
+    Description: Instance class of RDS DB Instance
+    Type: String
+    Default: db.t2.micro
+    AllowedValues:
+      - db.t2.micro
+  RDSInstanceStorage:
+    Description: Postgres RDS storage size
+    Type: String
+    Default: '20'
+  RDSInstanceVersion:
+    Description: Postgres RDS version
+    Type: String
+    Default: '15.3'
+  RDSInstanceBackupPeriod:
+    Description: Postgres RDS backup time retention. For dev is recomended 0 to disable.
+    Type: Number
+    Default: 15
+  RDSMasterUser:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /airflow/postgres/masteruser
+  RDSMasterPassword:
+    Type: String
+    Default: /airflow/postgres/masterpassword
+    Description: Name of the SSM parameter referencing rds master password.
+  RDSAirflowUser:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /airflow/postgres/userairflow
+  RDSAirflowPassword:
+    Type: String
+    Default: /airflow/postgres/passwordairflow
+    Description: Name of the SSM parameter referencing rds airflow password.
+  RDSDbName:
+    Type: String
+    Default: airflow_db
+    Description: RDS database name
+  AirflowFernetKey:
+    Type: String
+    Default: /airflow/config/fernetkey
+    Description: Parameter containing fernet key to be used in airflow.cfg
+  AirflowSecretKey:
+    Type: String
+    Default: /airflow/config/secretkey
+    Description: Parameter containing secret key to be used in airflow.cfg
+  AirflowConfigVersionId:
+    Type: String
+    Description: Version ID of the "airflow.cfg" template s3 bucket.
+  AirflowImageHelperDbUri:
+    Type: String
+    Description: Docker image URI airflow db helper
+Resources:
+  AirflowConfigCreator:
+    Type: Custom::AirflowConfiguration
+    Properties:
+      ServiceToken: !GetAtt AirflowConfigLambdaModifier.Arn
+      BucketName: 
+        'Fn::ImportValue': !Sub "${S3ConfigStackName}-S3ConfigBucketName"
+      RDSUri:
+        User: !Ref RDSAirflowUser
+        Password: !Ref RDSAirflowPassword
+        Address:  RDSPostgresInstance.Endpoint.Address
+        Port: 5432
+        DbName: RDSDbName
+      RedisUri:
+        Address: RedisCacheCluster.PrimaryEndPoint.Address
+        Port: 6379
+        Password: !Ref RedisPassword
+      Airflow:
+        FernetKey: !Ref AirflowFernetKey
+        SecretKey: !Ref AirflowSecretKey
+        ConfigVersion: !Ref AirflowConfigVersionId
+  AirflowConfigLambdaModifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import cfnresponse
+            import boto3
+            import io
+            import sys, logging, traceback, json
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+
+            def lambda_handler(event, context):
+                logger.info(event)
+                if event['RequestType'] == 'Delete':
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                    return
+                s3 = boto3.client('s3', region_name='${AWS::Region}')
+                ssm = boto3.client('ssm', region_name='${AWS::Region}')
+                
+                try:
+                    config = io.BytesIO()
+                    #  AIRFLOW CONFIG VERSION ID
+                    config_version = event['ResourceProperties']['Airflow']['ConfigVersion']
+
+                    # POSTGRES CONFIG
+                    postgres_password = ssm.get_parameter(Name=event['ResourceProperties']['RDSUri']['Password'], WithDecryption=True)['Parameter']['Value']
+                    postgres_user = event['ResourceProperties']['RDSUri']['User']
+                    postgres_address = event['ResourceProperties']['RDSUri']['Address']
+                    postgres_port = event['ResourceProperties']['RDSUri']['Port']
+                    postgres_db = event['ResourceProperties']['RDSUri']['DbName']
+                    rds_uri = f'postgresql+psycopg2://{postgres_user}:{postgres_password}@{postgres_address}:{postgres_port}/{postgres_db}'
+                    # REDIS CONFIG
+                    redis_password = ssm.get_parameter(Name=event['ResourceProperties']['RedisUri']['Password'], WithDecryption=True)['Parameter']['Value']
+                    redis_port = event['ResourceProperties']['RedisUri']['Port']
+                    redis_address = event['ResourceProperties']['RedisUri']['Address']
+                    redis_uri = f'redis://:{redis_password}@{redis_address}:{redis_port}/0'
+                    # AIRFLOW SECRETS
+                    fernet_key = ssm.get_parameter(Name=event['ResourceProperties']['Airflow']['FernetKey'], WithDecryption=True)['Parameter']['Value']
+                    secret_key = ssm.get_parameter(Name=event['ResourceProperties']['Airflow']['SecretKey'], WithDecryption=True)['Parameter']['Value']
+                    # DOWNLOAD CONFIG TEMPLATE
+                    s3.download_fileobj(
+                        Bucket = event['ResourceProperties']['BucketName'],
+                        Key = 'config-templates/airflow.cfg',
+                        Fileobj = config,
+                        ExtraArgs = {'VersionId': config_version}
+                    )
+                    template = config.getvalue().decode('utf-8')
+                    template = template.replace('#{FERNET_KEY}', fernet_key)
+                    template = template.replace('#{SECRET_KEY}', secret_key)
+                    template = template.replace('#{POSTGRES_URI}', rds_uri)
+                    template = template.replace('#{REDIS_URI}', redis_uri)
+                    s3.upload_fileobj(
+                        Bucket = event['ResourceProperties']['BucketName'],
+                        Key = 'config/airflow.cfg',
+                        Fileobj = io.BytesIO(str.encode(template, encoding='utf-8'))
+                    )
+                    response_data = {}
+                    response_data['BucketName'] = event['ResourceProperties']['BucketName']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, "AirflowConfigCreator")
+                except Exception:
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                    exception_type, exception_value, exception_traceback = sys.exc_info()
+                    traceback_string = traceback.format_exception(exception_type, exception_value, exception_traceback)
+                    err_msg = json.dumps({
+                        "errorType": exception_type.__name__,
+                        "errorMessage": str(exception_value),
+                        "stackTrace": traceback_string
+                    })
+                    logger.error(err_msg)
+
+      Role: !GetAtt AirflowConfigLambdaRole.Arn
+      Timeout: 30
+  AirflowConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-ssm-parameters"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ssm:GetParameter
+            Resource: arn:aws:ssm:us-east-1:320488417544:parameter/airflow/*
+      - PolicyName: !Sub "${AWS::StackName}-airflow-config-lambda-logs"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: !Sub "${AWS::StackName}-s3-read-only-access"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action: ["s3:GetObject","s3:PutObject","s3:GetObjectVersion"]
+            Resource: !Sub
+            - "${BucketArn}/*"
+            - BucketArn:
+                Fn::ImportValue:
+                  !Sub "${S3ConfigStackName}-S3ConfigBucketBucketArn"
+  AirflowConfigDbUser:
+    Type: Custom::RDSUser
+    Properties:
+      ServiceToken: !GetAtt AirflowConfigDbLambda.Arn
+      RDSUri:
+        Address:  RDSPostgresInstance.Endpoint.Address
+        Port: 5432
+        DbName: RDSDbName
+  AirflowConfigDbLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ImageUri: !Ref AirflowImageHelperDbUri
+      Role: !GetAtt AirflowConfigLambdaRole.Arn
+      Timeout: 60

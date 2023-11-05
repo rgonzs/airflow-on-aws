@@ -1,0 +1,13 @@
+[Unit]
+Description=server custom health checker
+After=network.target
+[Service]
+User=airflow
+Group=airflow
+Type=simple
+ExecStart=/usr/bin/bash /opt/helpers/health-checker.sh
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target

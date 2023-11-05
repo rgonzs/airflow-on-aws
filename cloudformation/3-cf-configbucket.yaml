@@ -1,0 +1,21 @@
+Description: Template to create an s3 bucket to store airflow configurations.
+Resources:
+  S3ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - BucketKeyEnabled: true
+Outputs:
+  S3Bucket:
+    Description: S3 Bucket
+    Value: !Ref S3ConfigBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3ConfigBucketName"
+  S3BucketArn:
+    Description: S3 Bucket ARN
+    Value: !GetAtt S3ConfigBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3ConfigBucketBucketArn"
