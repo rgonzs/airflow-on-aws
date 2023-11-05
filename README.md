@@ -22,6 +22,8 @@ Resources:
 - Route Tables
 - InternetGateway
 
+> To save cost, I used a "nat instance", but you can deploy a nat gateway in VPC.
+
 **CONFIGURATION**
 Stack Name: kodelab-network-stack
 
